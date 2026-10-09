@@ -120,6 +120,164 @@ def remove_dark_marker(img_rgb, kernel_size=21, thresh=30, inpaint_radius=6):
     return cv2.inpaint(img_rgb, dark_marker_mask, inpaint_radius, cv2.INPAINT_TELEA), dark_marker_mask
 
 
+def is_rectangular_contour(c, max_vertices=5, min_extent=0.8):
+    """
+    True when a contour looks like a man-made rectangular object (a calibration
+    card, ruler, sticker label) rather than an organic lesion boundary. Circularity
+    alone can't tell these apart -- a filled square already scores ~0.79 on
+    4*pi*area/perimeter^2, comfortably past the lenient min_circularity cutoff used
+    elsewhere in this file -- so this checks shape more directly, two ways at once:
+    cv2.approxPolyDP at a fine tolerance (2% of perimeter) collapses a true straight-
+    edged rectangle to about 4 vertices, while a real lesion boundary needs many more
+    to trace its natural irregularity even when fairly round; and cv2.minAreaRect
+    gives the contour's own rotated bounding rectangle, which a true rectangle fills
+    almost completely (extent close to 1.0) but an organic blob typically fills well
+    under min_extent of. Both must hold at once, so a small, simple, fairly round
+    lesion (few vertices at this tolerance, but with plenty of empty space around it
+    in its bounding rect) is not caught by this.
+    """
+    perimeter = cv2.arcLength(c, True)
+    if perimeter == 0:
+        return False
+    approx = cv2.approxPolyDP(c, 0.02 * perimeter, True)
+    (rect_w, rect_h) = cv2.minAreaRect(c)[1]
+    if rect_w * rect_h == 0:
+        return False
+    extent = cv2.contourArea(c) / (rect_w * rect_h)
+    return len(approx) <= max_vertices and extent >= min_extent
+
+
+def strip_rectangular_artifacts(img_rgb, min_area_frac=0.02, max_iterations=3,
+                                 blur_ksize=(15, 15), morph_kernel_size=15,
+                                 rect_max_vertices=5, rect_min_extent=0.8):
+    """
+    Removes man-made rectangular objects (calibration cards, rulers, sticker labels)
+    that survive as one large, high-contrast blob under the *same* Otsu threshold
+    boundary_localization_crop's own lesion search uses further down -- rather than
+    trying to darkness-threshold them away with a separate, fixed, hand-picked cutoff
+    the way remove_border_vignette does. That fixed-threshold approach turned out to
+    be resolution-fragile: at low resolution (e.g. this dataset's 512x512 images) a
+    dark rectangular object's edge, where it blends into lighter skin, occupies a much
+    bigger fraction of its silhouette than at high resolution, and a large chunk of
+    the object ends up in a "medium gray" band that no single fixed threshold reaches
+    -- so only a small fragment of it would get flagged and removed, leaving a dark,
+    still-rectangular residual that keeps winning the contour search over the actual
+    lesion. Otsu's threshold is chosen per-image instead of fixed, so it adapts to
+    wherever that image's actual card/skin brightness gap falls, and reliably captures
+    the whole object as a single clean contour in one pass.
+
+    Iterates (up to max_iterations times) rather than running once: finds the single
+    largest Otsu-thresholded contour, and if it is both large (>= min_area_frac of the
+    image) and rectangular (is_rectangular_contour, using rect_max_vertices/
+    rect_min_extent), fills it with the mean color of everything else and repeats --
+    stopping as soon as the largest remaining contour is too small or not rectangular
+    (a real lesion, even a large dark one, is never mistaken for "rectangular" by
+    is_rectangular_contour, so this does not erode into it). Handles the rare case of
+    more than one such object without needing a fixed count in advance.
+
+    Returns the cleaned img_rgb (unchanged if nothing qualified).
+    """
+    image = img_rgb.copy()
+    for _ in range(max_iterations):
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        blurred = cv2.GaussianBlur(gray, blur_ksize, 0)
+        _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_kernel_size, morph_kernel_size))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            break
+        biggest = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(biggest) < min_area_frac * gray.size:
+            break
+        if not is_rectangular_contour(biggest, rect_max_vertices, rect_min_extent):
+            break
+        artifact_mask = np.zeros_like(gray, dtype=np.uint8)
+        cv2.drawContours(artifact_mask, [biggest], -1, 255, thickness=cv2.FILLED)
+        non_artifact = artifact_mask == 0
+        if not non_artifact.any():
+            break
+        fill_color = image[non_artifact].reshape(-1, 3).mean(axis=0)
+        image[artifact_mask == 255] = fill_color
+    return image
+
+
+def remove_border_vignette(img_rgb, dark_thresh=60, inpaint_radius=6, morph_kernel_size=31):
+    """
+    Removes a dark border/vignette that touches the image edge -- e.g. a thick
+    black surround around a smaller circular photographed area, common in ISIC
+    images -- before boundary localization runs. Left in, this can otherwise
+    out-compete the actual lesion: strip_uniform_border only catches borders
+    that are near-perfectly uniform row-by-row/column-by-column (std below
+    uniform_border_std), which a vignette with any gradient, compression noise,
+    or non-rectangular (e.g. circular) shape won't pass; border_margin_frac only
+    zeroes a fixed-width band, which a thicker or irregular vignette extends
+    well past. Unlike either, this works for any shape or thickness, since it
+    doesn't assume uniformity or a fixed width -- only that a vignette (unlike a
+    lesion, which dermoscopy protocol keeps centered) touches the image border.
+
+    Thresholds the image for dark pixels, then keeps only the connected dark
+    regions that touch row/column 0 or the last row/column -- a real lesion,
+    even a dark one, is essentially never connected all the way out to the
+    image edge, so this is a low-false-positive way to isolate vignette/frame
+    artifacts specifically, without also catching the lesion itself.
+
+    Real borders are rarely perfectly solid -- compression noise, a slight
+    brightness gradient, or small artifacts leave scattered pixels just above
+    `dark_thresh`, punching tiny holes through the border in the raw dark
+    mask. Those holes can locally break the border's connectivity to the
+    image edge, so a chunk of border on the far side of a hole never gets
+    flagged as "touching the border" and survives unfilled. `morph_kernel_size`
+    runs a morphological closing on the dark mask first (dilate then erode,
+    same technique boundary_localization_crop's own morph_kernel_size uses on
+    its threshold mask) to bridge those small gaps before labeling connected
+    components, so a border with minor internal noise still reads as one
+    solid, edge-connected region. Set to 0 to disable.
+
+    Returns (cleaned_img_rgb, vignette_mask) -- same img_rgb back unchanged if
+    no border-touching dark region was found.
+
+    Fills the vignette with a flat color (the mean of the surrounding
+    non-vignette pixels) instead of cv2.inpaint()'s texture reconstruction --
+    inpaint() (Telea) works well for remove_marker/remove_dark_marker's thin
+    marks, but over a mask this large (a big chunk of the whole image), it has
+    almost no real texture to propagate from and tends to wash out to a flat,
+    near-white fill instead. That fill is *different* from the true
+    surrounding skin tone, which can itself become a new spurious contour
+    candidate downstream -- a flat fill matching the actual skin tone doesn't
+    have that problem, and it doesn't need to look realistic since this
+    region gets discarded by the crop either way.
+    """
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    dark_mask = (gray < dark_thresh).astype(np.uint8)
+
+    if morph_kernel_size > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_kernel_size, morph_kernel_size))
+        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, kernel)  # bridge small noise holes
+
+    n_labels, labels = cv2.connectedComponents(dark_mask)
+
+    border_labels = set(labels[0, :]) | set(labels[-1, :]) | set(labels[:, 0]) | set(labels[:, -1])
+    border_labels.discard(0)  # label 0 is the non-dark background, not a component
+
+    if not border_labels:
+        return img_rgb, np.zeros_like(dark_mask, dtype=np.uint8)
+
+    vignette_mask = np.isin(labels, list(border_labels)).astype(np.uint8) * 255
+
+    non_vignette = vignette_mask == 0
+    if not non_vignette.any():
+        # degenerate case: the whole image was flagged as vignette -- nothing
+        # to average, so fall back to inpaint rather than filling with nothing
+        return cv2.inpaint(img_rgb, vignette_mask, inpaint_radius, cv2.INPAINT_TELEA), vignette_mask
+
+    fill_color = img_rgb[non_vignette].reshape(-1, 3).mean(axis=0)
+    cleaned = img_rgb.copy()
+    cleaned[vignette_mask == 255] = fill_color
+    return cleaned, vignette_mask
+
+
 def boundary_localization_crop(
     image,
     blur_ksize=(15, 15),
@@ -131,6 +289,9 @@ def boundary_localization_crop(
     min_area_frac=0.01,
     central_frac=0.8,
     min_circularity=0.25,
+    reject_rectangular=True,
+    rect_max_vertices=5,
+    rect_min_extent=0.8,
     strip_uniform_border=True,
     uniform_border_std=5.0,
     uniform_border_bright=200,
@@ -145,6 +306,13 @@ def boundary_localization_crop(
     dark_marker_kernel_size=21,
     dark_marker_thresh=30,
     dark_marker_inpaint_radius=6,
+    strip_rectangular=True,
+    rect_artifact_min_area_frac=0.02,
+    rect_artifact_max_iterations=3,
+    strip_border_vignette=True,
+    vignette_dark_thresh=60,
+    vignette_inpaint_radius=6,
+    vignette_morph_kernel_size=31,
     output_size=None,
 ):
     """
@@ -187,6 +355,22 @@ def boundary_localization_crop(
         Among everything that survives both filters, the largest by area
         is picked, not the most circular -- circularity here is a filter
         against non-lesion shapes, not a target to maximize.
+    strip_rectangular, rect_artifact_min_area_frac, rect_artifact_max_iterations,
+    rect_max_vertices, rect_min_extent : man-made rectangular objects that end up in
+        frame (a calibration card, ruler, sticker label) are dark/high-contrast enough
+        to survive the filters above (min_area_frac, min_circularity, since a filled
+        rectangle is reasonably circular too -- a square scores ~0.79, well clear of
+        the lenient 0.25 cutoff). See is_rectangular_contour() and
+        strip_rectangular_artifacts() above for the shape test and removal step this
+        runs before anything else here -- deliberately before strip_border_vignette
+        and strip_uniform_border, since a large rectangular artifact's darkness would
+        otherwise skew this function's own Otsu threshold at the end. rect_max_vertices
+        and rect_min_extent tune the same underlying shape test used a second time
+        below, as a final safety net at contour-selection time (reject_rectangular) --
+        in case a rectangular object is too small or too low-contrast for
+        strip_rectangular_artifacts to have caught upstream, but still ends up the
+        largest contour here. Set strip_rectangular=False or reject_rectangular=False
+        to disable either independently.
     strip_uniform_border, uniform_border_std, uniform_border_bright,
     uniform_border_dark : some images have a thick uniform white (sticker-
         style) or black frame border around the actual photo. Left in,
@@ -210,6 +394,12 @@ def boundary_localization_crop(
         right after remove_marker, catches black/dark marker ink and
         writing that the color-based check above can't (it deliberately
         skips black ink). Set strip_dark_marker=False to disable.
+    strip_border_vignette, vignette_dark_thresh, vignette_inpaint_radius,
+    vignette_morph_kernel_size : see remove_border_vignette() above --
+        applied right after remove_dark_marker, catches a dark border/
+        vignette touching the image edge (any shape/thickness) that
+        strip_uniform_border and border_margin_frac below can each miss on
+        their own. Set strip_border_vignette=False to disable.
     output_size : if given, the returned roi is resized to
         (output_size, output_size) via cv2.resize -- so every crop comes
         back at a consistent size (e.g. IMG_SIZE) instead of the raw,
@@ -232,6 +422,13 @@ def boundary_localization_crop(
     if strip_dark_marker:
         image, _ = remove_dark_marker(image, dark_marker_kernel_size, dark_marker_thresh,
                                        dark_marker_inpaint_radius)
+
+    if strip_rectangular:
+        image = strip_rectangular_artifacts(image, rect_artifact_min_area_frac, rect_artifact_max_iterations,
+                                             blur_ksize, morph_kernel_size, rect_max_vertices, rect_min_extent)
+
+    if strip_border_vignette:
+        image, _ = remove_border_vignette(image, vignette_dark_thresh, vignette_inpaint_radius, vignette_morph_kernel_size)
 
     h_img, w_img = image.shape[:2]
     gray_full = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
@@ -293,6 +490,8 @@ def boundary_localization_crop(
             if cv2.contourArea(c) < min_area_frac * content_area:
                 return False
             if circularity(c) < min_circularity:
+                return False
+            if reject_rectangular and is_rectangular_contour(c, rect_max_vertices, rect_min_extent):
                 return False
             x, y, w, h = cv2.boundingRect(c)
             ccx, ccy = x + w / 2, y + h / 2
